@@ -20,7 +20,7 @@ MORTALITY_TIME_LABEL = None
 
 DISPLAY_START_YEAR = 2026
 END_YEAR = 2070
-MAX_AGE = 100
+MAX_AGE = 110
 
 # Units (set to match your downloaded files)
 FERTILITY_RATE_PER = 1000    # ASFR is usually per 1,000 women
@@ -160,18 +160,81 @@ def to_number(x):
 
 def expand_5yr_to_single_counts(age_group_values, max_age=100):
     arr = np.zeros(max_age + 1, dtype=float)
+    bins = []
     for (start, end), value in age_group_values.items():
         if start is None:
             continue
         start = max(0, min(start, max_age))
         end = max(0, min(end, max_age))
-        if start == end:
-            arr[start] = value
-        else:
+        if end < start:
+            continue
+        bins.append((start, end, float(value)))
+
+    if not bins:
+        return arr
+
+    bins.sort(key=lambda x: x[0])
+    contiguous = all(bins[i][0] == bins[i - 1][1] + 1 for i in range(1, len(bins)))
+    if not contiguous:
+        # Fallback to uniform split when groups are not contiguous.
+        for start, end, value in bins:
             width = end - start + 1
-            if width <= 0:
-                continue
             arr[start:end + 1] += value / width
+        return arr
+
+    widths = np.array([end - start + 1 for start, end, _ in bins], dtype=float)
+    means = np.array([value / width for (_, _, value), width in zip(bins, widths)], dtype=float)
+    n = len(bins)
+
+    # Build all edge values as a function of one free parameter x0:
+    # x_{i+1} = 2*m_i - x_i  ->  x_i = a_i*x0 + b_i
+    a = np.zeros(n + 1, dtype=float)
+    b = np.zeros(n + 1, dtype=float)
+    a[0] = 1.0
+    for i in range(n):
+        a[i + 1] = -a[i]
+        b[i + 1] = 2.0 * means[i] - b[i]
+
+    # Feasible interval for non-negative edges.
+    lo = -np.inf
+    hi = np.inf
+    feasible = True
+    for ai, bi in zip(a, b):
+        if ai > 0:
+            lo = max(lo, -bi)
+        elif ai < 0:
+            hi = min(hi, bi)
+        elif bi < 0:
+            feasible = False
+
+    # Choose x0 that minimizes curvature within the feasible interval.
+    if n > 1:
+        alphas = np.zeros(n - 1, dtype=float)
+        betas = np.zeros(n - 1, dtype=float)
+        for i in range(n - 1):
+            alphas[i] = a[i] - 2.0 * a[i + 1] + a[i + 2]
+            betas[i] = b[i] - 2.0 * b[i + 1] + b[i + 2]
+        denom = np.sum(alphas * alphas)
+        if denom > 0:
+            x0 = -np.sum(alphas * betas) / denom
+        else:
+            x0 = means[0]
+    else:
+        x0 = means[0]
+
+    if feasible and lo <= hi:
+        x0 = min(max(x0, lo), hi)
+
+    edges = a * x0 + b
+
+    for i, (start, end, _value) in enumerate(bins):
+        width = end - start + 1
+        left = edges[i]
+        right = edges[i + 1]
+        for k, age in enumerate(range(start, end + 1)):
+            t = (k + 0.5) / width
+            arr[age] = (1.0 - t) * left + t * right
+
     return arr
 
 
@@ -483,14 +546,17 @@ def build_plotly_pyramid(results):
     fig.frames = frames
 
     fig.update_layout(
+        margin=dict(t=160, r=40, b=190, l=40),
         updatemenus=[
             dict(
                 type="buttons",
                 showactive=False,
-                x=0.01,
-                y=1.12,
-                xanchor="left",
+                direction="left",
+                x=0.5,
+                y=-0.30,
+                xanchor="center",
                 yanchor="top",
+                pad={"r": 8, "t": 0},
                 buttons=[
                     dict(label="Play", method="animate", args=[None, {"frame": {"duration": 300, "redraw": True}, "fromcurrent": True}]),
                     dict(label="Pause", method="animate", args=[[None], {"frame": {"duration": 0}, "mode": "immediate"}]),
@@ -500,7 +566,10 @@ def build_plotly_pyramid(results):
         sliders=[
             dict(
                 active=0,
-                pad={"t": 50},
+                x=0.08,
+                y=-0.16,
+                len=0.84,
+                pad={"t": 18, "b": 0},
                 steps=[
                     dict(method="animate", args=[[str(y)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}], label=str(y))
                     for y in plot_years
